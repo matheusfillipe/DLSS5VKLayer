@@ -539,6 +539,7 @@ struct SwapchainState {
     uint32_t pendingW = 0;
     uint32_t pendingH = 0;
     size_t pendingBytes = 0;
+    double pendingSentMs = 0.0;
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cb = VK_NULL_HANDLE;
     // Reused by the present path; resizing only occurs when an unusual caller supplies more waits.
@@ -1666,6 +1667,27 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     const bool rawBypass = fs.compositionBypass && modelW == sc.width && modelH == sc.height;
     const bool pipelined = !repaint && ShmPipelined(dc->shm) && !rawBypass && !sc.comp->ProxyActive() &&
                            !answerViaFd;
+    // Pipelined, while the model still works on the previous frame, this present shows the last
+    // composed picture again and drops the frame, so the game keeps its own pace and the picture
+    // updates at the model's. After kStaleAnswerMs without an answer we fall back to the blocking
+    // collect, which knows how to give up on a helper that died.
+    static constexpr double kStaleAnswerMs = 500.0;
+    if (pipelined && sc.pendingReq && sc.comp->HasModelFrame() && dc->shm.hdr &&
+        sc.pendingW == modelW && sc.pendingH == modelH && sc.pendingBytes == sc.comp->ModelBytes() &&
+        dc->shm.hdr->seq_resp.load(std::memory_order_acquire) < sc.pendingReq &&
+        NowMs() - sc.pendingSentMs < kStaleAnswerMs) {
+        if (!NoteVk(dc, dc->vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return false;
+        if (!sc.comp->RecordComposedCopy(cb, swapchainImage)) {
+            dc->vkEndCommandBuffer(cb);
+            return false;
+        }
+        if (!endAndSubmit(sc.fenceLeg1)) return false;
+        if (!waitAndReset(sc.fenceLeg1)) return false;
+        dropWaits();
+        PublishFrameStats(dc, sc, time ? NowMs() - t0 : 0.0);
+        return true;
+    }
+
     bool havePrevious = false;
     if (sc.pendingReq) {
         // A request that went out is owed its answer even when nothing will use it, or the next
@@ -1703,6 +1725,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
             sc.pendingW = modelW;
             sc.pendingH = modelH;
             sc.pendingBytes = sc.comp->ModelBytes();
+            sc.pendingSentMs = NowMs();
         }
         if (resolved) PublishFrameStats(dc, sc, time ? NowMs() - t0 : 0.0);
         if (time) {
