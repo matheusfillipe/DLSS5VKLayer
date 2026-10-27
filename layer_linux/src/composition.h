@@ -190,6 +190,9 @@ class Composition {
     // is on, and leg 1 only writes it while it is on. Turning it off mid-run falls back to the
     // shared-memory transport on the next frame.
     void SetDmaBuf(bool on) { _dmaBuf = on; }
+    // The raw bypass copies the answer straight onto the swapchain image, which a pipelined frame
+    // still has to capture afterwards, so pipelining sends the raw answer through the resolve shader.
+    void SetRawCopy(bool allowed) { _rawCopyAllowed = allowed; }
     bool DmaBuf() const { return _dmaBuf; }
 
     // True when leg 1 writes the proxy into the imported image this frame, so the caller must not
@@ -334,6 +337,7 @@ class Composition {
     bool _captureRecorded = false;
     // The raw bypass already wrote the swapchain image, so the composed copy has nothing to do.
     bool _rawCopied = false;
+    bool _rawCopyAllowed = true;
 
     // Frame hold. The freeze point is the raw colour the encode reads, not the proxy: both the proxy
     // and the untouched keep are derived from it, and freezing further down would stop a setting

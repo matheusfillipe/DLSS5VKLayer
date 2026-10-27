@@ -1418,7 +1418,7 @@ bool Composition::RecordResolve(VkCommandBuffer cb, VkImage swapchainImage, cons
     // The flag is the layer's own decision from before the request went out, so it and the helper
     // agree on which surface holds this frame's answer.
     const bool dmaAnswer = AnswerViaFd();
-    const bool rawCopy = s.compositionBypass != 0 && s.compareMode == 0 && !_capture.Active() &&
+    const bool rawCopy = _rawCopyAllowed && s.compositionBypass != 0 && s.compareMode == 0 && !_capture.Active() &&
                          !_superSample && !_hdrProxy && !_linearHdr &&
                          _modelW == _width && _modelH == _height &&
                          (dmaAnswer ? _answerXfer.format : _model.format) == _workFormat;

@@ -1820,13 +1820,10 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     // picture is one frame behind the game. The proxy and the keep are a single set of surfaces, which
     // stays correct because the previous answer is collected before this frame's capture overwrites
     // what that answer's resolve reads.
-    // The raw bypass, possible only when the model works at the frame's own size, writes the swapchain
-    // image during the resolve, before the capture would read it.
     const uint32_t modelW = sc.comp->ModelWidth();
     const uint32_t modelH = sc.comp->ModelHeight();
-    const bool rawBypass = fs.compositionBypass && modelW == sc.width && modelH == sc.height;
-    const bool pipelined = !repaint && ShmPipelined(dc->shm) && !rawBypass && !sc.comp->ProxyActive() &&
-                           !answerViaFd;
+    const bool pipelined = !repaint && ShmPipelined(dc->shm) && !sc.comp->ProxyActive() && !answerViaFd;
+    sc.comp->SetRawCopy(!pipelined);
     // Pipelined, while the model still works on the previous frame, this present shows the last
     // composed picture again and drops the frame, so the game keeps its own pace and the picture
     // updates at the model's. After kStaleAnswerMs without an answer we fall back to the blocking
