@@ -71,6 +71,7 @@ private:
     std::unordered_map<VkFramebuffer, std::vector<VkImageView>> _framebuffers;
     std::unordered_map<VkRenderPass, RenderPass> _renderPasses;
     std::unordered_map<VkCommandBuffer, Pass> _passes;
+    Pick _lastPick;
 };
 
 }  // namespace dlssnr

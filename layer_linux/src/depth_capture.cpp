@@ -153,6 +153,14 @@ bool DepthCapture::PickAndReset(uint32_t swapWidth, uint32_t swapHeight, Pick* p
             *pick = Pick{image, img.format, img.width, img.height, img.layout};
         }
     }
+    // An emulator can present more than once per game frame, and a present with no draws behind it
+    // still shows the last frame's scene.
+    if (!pick->image) {
+        auto last = _images.find(_lastPick.image);
+        if (last != _images.end()) *pick = Pick{_lastPick.image, last->second.format, last->second.width,
+                                                last->second.height, last->second.layout};
+    }
+    _lastPick = *pick;
     return pick->image != VK_NULL_HANDLE;
 }
 
