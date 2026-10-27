@@ -839,13 +839,6 @@ bool Composition::Prepare(uint32_t width, uint32_t height, VkFormat swapchainFor
         MakeImage(_model, modelW, modelH, proxyFormat, sampled | src | dst) &&
         MakeImage(_composed, width, height, work, storage | src);
 
-    // The transport pair is sized to the model raster and rebuilt against whatever mapping is
-    // currently pointed at it -- the shared-memory regions when there are any, staging otherwise.
-    _modelW = modelW;
-    _modelH = modelH;
-    EnsureTransport();
-    const bool okTransport = _download.buffer && _upload.buffer;
-
 
     // The meter is a fixed 64x64 grid whatever the frame is, and is only built when there is
     // something to measure: on a frame the game already tone mapped there is no white point to find,
@@ -878,6 +871,15 @@ bool Composition::Prepare(uint32_t width, uint32_t height, VkFormat swapchainFor
         _superUp.reset();
         _superDown.reset();
     }
+
+    // The transport pair is sized to the model raster and rebuilt against whatever mapping is
+    // currently pointed at it -- the shared-memory regions when there are any, staging otherwise.
+    // It comes after every image: once the shared memory is imported as a host pointer, NVIDIA
+    // refuses each further device allocation as out of device memory.
+    _modelW = modelW;
+    _modelH = modelH;
+    EnsureTransport();
+    const bool okTransport = _download.buffer && _upload.buffer;
 
     if (!ok || !okTransport || !okWork || !okMeter || !okSuper) {
         _reason = "could not allocate the composition surfaces";
