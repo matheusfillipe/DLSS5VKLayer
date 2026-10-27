@@ -1409,8 +1409,9 @@ bool Composition::RecordCapture(VkCommandBuffer cb, VkImage swapchainImage, cons
 // ---------------------------------------------------------------------------
 // Leg 2: the model's answer, composed back
 // ---------------------------------------------------------------------------
-bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s) {
+bool Composition::RecordResolve(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s) {
     if (!_usable || !_composed.image) return false;
+    _rawCopied = false;
 
     // dma-buf: the answer is already device memory this process can read -- the helper released it
     // before it answered, and the sequence handshake ordered that before this submit. No upload.
@@ -1479,6 +1480,7 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
                                       VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &rel);
             _answerXfer.layout = VK_IMAGE_LAYOUT_UNDEFINED;
         }
+        _rawCopied = true;
         return true;
     }
     if (_superSample) {
@@ -1542,6 +1544,14 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
         _vk->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                   VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &rel);
         _answerXfer.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+    return true;
+}
+
+bool Composition::RecordComposedCopy(VkCommandBuffer cb, VkImage swapchainImage) {
+    if (_rawCopied) {
+        _rawCopied = false;
+        return true;
     }
 
     Transition(cb, _composed, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);

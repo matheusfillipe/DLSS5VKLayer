@@ -142,7 +142,16 @@ class Composition {
     void* ModelPixels() { return _upload.mapped; }
 
     // Leg 2. Composes and leaves the swapchain image holding the result, in PRESENT_SRC_KHR.
-    bool RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s);
+    bool RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s) {
+        return RecordResolve(cb, swapchainImage, s) && RecordComposedCopy(cb, swapchainImage);
+    }
+
+    // Leg 2 in two halves, so a pipelined frame can resolve the previous answer, capture the new
+    // frame over the surfaces that resolve read, and only then cover the swapchain image. The resolve
+    // reads the keep, the proxy and the answer and writes only the composed surface, except in the
+    // raw bypass, which writes the swapchain image itself and leaves the copy nothing to do.
+    bool RecordResolve(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s);
+    bool RecordComposedCopy(VkCommandBuffer cb, VkImage swapchainImage);
 
     // Whether a frame has ever been captured from the swapchain.
     //
@@ -323,6 +332,8 @@ class Composition {
 
     CaptureWriter _capture;
     bool _captureRecorded = false;
+    // The raw bypass already wrote the swapchain image, so the composed copy has nothing to do.
+    bool _rawCopied = false;
 
     // Frame hold. The freeze point is the raw colour the encode reads, not the proxy: both the proxy
     // and the untouched keep are derived from it, and freezing further down would stop a setting

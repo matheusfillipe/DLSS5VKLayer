@@ -345,16 +345,32 @@ static bool DmaBufEnabled() {
     return on;
 }
 
-static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, const void* proxy,
-                          void* modelOut, bool proxyInRegion, bool answerFromFd, bool hdrEncode) {
+// A layer-only control word in the header region past the header itself, which the helper never
+// reads or writes, so the layer can change how it waits without a new helper build.
+static constexpr size_t kPipelinedOffset = kHeaderBytes - 64;
+static_assert(sizeof(ShmHeader) <= kPipelinedOffset, "the pipelined flag sits inside the header");
+
+// Pipelined, each present shows the answer to the frame before it and leaves the model working on
+// its own frame while the game renders the next one, so the game never waits for the model.
+static bool ShmPipelined(const ShmMap& s) {
+    if (!s.hdr) return false;
+    const auto* flag = reinterpret_cast<const std::atomic<uint32_t>*>(
+        reinterpret_cast<const uint8_t*>(s.hdr) + kPipelinedOffset);
+    return flag->load(std::memory_order_relaxed) != 0;
+}
+
+static bool ShmCollect(ShmMap& s, uint32_t req, uint32_t w, uint32_t h, size_t bytes, void* modelOut,
+                       bool answerFromFd, double t0, double tCopy);
+
+// Publish the proxy and the request for it. *reqOut is the number to collect the answer by.
+static bool ShmSend(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, const void* proxy,
+                    bool proxyInRegion, bool hdrEncode, uint32_t* reqOut, double* tCopyOut) {
     if (s.dead) return false;
     if (!ShmOpen(s)) { s.dead = true; return false; }
     if (w > kMaxW || h > kMaxH || w < kMinW || h < kMinH) return false;
     if (bytes != size_t(w) * h * 4 && bytes != size_t(w) * h * 8) return false;
     if (s.hdr->quit.load()) { s.dead = true; return false; }
 
-    const bool time = TimeEnabled();
-    const double t0 = NowMs();
     if (!ShmMapFrames(s, bytes)) { s.dead = true; return false; }
     // When the transport buffer IS this region (the imported case), or the proxy crossed as a
     // dma-buf instead, the GPU already wrote the bytes where they belong and there is nothing to
@@ -374,6 +390,26 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, con
     // by leg 1's vkWaitForFences; this fence covers the host-visible ordering across processes.)
     std::atomic_thread_fence(std::memory_order_release);
     s.hdr->seq_req.store(req);
+    *reqOut = req;
+    *tCopyOut = tCopy;
+    return true;
+}
+
+static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, const void* proxy,
+                          void* modelOut, bool proxyInRegion, bool answerFromFd, bool hdrEncode) {
+    const double t0 = NowMs();
+    uint32_t req = 0;
+    double tCopy = 0.0;
+    if (!ShmSend(s, w, h, bytes, proxy, proxyInRegion, hdrEncode, &req, &tCopy)) return false;
+    return ShmCollect(s, req, w, h, bytes, modelOut, answerFromFd, t0, tCopy);
+}
+
+// Wait for the answer to request `req` and copy it to modelOut; a null modelOut collects it only to
+// keep the sequence in step.
+static bool ShmCollect(ShmMap& s, uint32_t req, uint32_t w, uint32_t h, size_t bytes, void* modelOut,
+                       bool answerFromFd, double t0, double tCopy) {
+    if (s.dead || !s.hdr) return false;
+    const bool time = TimeEnabled();
 
     // How long this frame may wait, which is a question about whether anyone is listening.
     //
@@ -412,7 +448,8 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, con
             const bool ok = s.hdr->seq_ok.load() >= req && s.hdr->answeredW.load() == w &&
                             s.hdr->answeredH.load() == h;
             if (!ok) Log("[shm] helper could not use frame %u (ok=%u)", req, s.hdr->seq_ok.load());
-            if (ok && !answerFromFd && modelOut != (void*) s.outPixels) std::memcpy(modelOut, s.outPixels, bytes);
+            if (ok && modelOut && !answerFromFd && modelOut != (void*) s.outPixels)
+                std::memcpy(modelOut, s.outPixels, bytes);
             if (time) {
                 static int frameNo = 0;
                 if (++frameNo % TimeInterval() == 0) {
@@ -497,6 +534,11 @@ struct SwapchainState {
     VkFence fenceLeg1 = VK_NULL_HANDLE;
     VkFence fenceLeg2 = VK_NULL_HANDLE;
     bool leg2Pending = false;
+    // The request a pipelined frame left with the model, collected by the next present.
+    uint32_t pendingReq = 0;
+    uint32_t pendingW = 0;
+    uint32_t pendingH = 0;
+    size_t pendingBytes = 0;
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cb = VK_NULL_HANDLE;
     // Reused by the present path; resizing only occurs when an unusual caller supplies more waits.
@@ -1424,6 +1466,19 @@ static bool NoteVk(DeviceChain* dc, VkResult r, const char* what) {
 // handed to vkQueuePresentKHR again; the caller presents with none.
 //
 // Every path out leaves the swapchain image in PRESENT_SRC_KHR, including the ones that give up.
+static void PublishFrameStats(DeviceChain* dc, SwapchainState& sc, double layerMs) {
+    if (!dc->shm.hdr) return;
+    ShmStore64(dc->shm.hdr->layerFramesLo, dc->shm.hdr->layerFramesHi, ++dc->framesComposed);
+    dc->shm.hdr->layerWidth.store(sc.width);
+    dc->shm.hdr->layerHeight.store(sc.height);
+    dc->shm.hdr->layerFormat.store(uint32_t(sc.format));
+    dc->shm.hdr->layerCompositionUp.store(1);
+    dc->shm.hdr->layerPid.store(uint32_t(getpid()));
+    dc->shm.hdr->layerMsBits.store(FloatToBits(float(layerMs)));
+    dc->shm.hdr->layerMeasuredWhiteBits.store(FloatToBits(sc.comp->MeasuredWhitePoint()));
+    dc->shm.hdr->layerHeartbeat.fetch_add(1);
+}
+
 static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
                             VkImage swapchainImage, uint32_t waitCount,
                             const VkSemaphore* waitSemaphores, bool repaint,
@@ -1599,6 +1654,65 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         return true;
     };
 
+    // Pipelined, this present composes the answer to the previous frame and hands this one to the
+    // model without waiting for it, so the game renders the next frame while the model works and the
+    // picture is one frame behind the game. The proxy and the keep are a single set of surfaces, which
+    // stays correct because the previous answer is collected before this frame's capture overwrites
+    // what that answer's resolve reads.
+    // The raw bypass, possible only when the model works at the frame's own size, writes the swapchain
+    // image during the resolve, before the capture would read it.
+    const uint32_t modelW = sc.comp->ModelWidth();
+    const uint32_t modelH = sc.comp->ModelHeight();
+    const bool rawBypass = fs.compositionBypass && modelW == sc.width && modelH == sc.height;
+    const bool pipelined = !repaint && ShmPipelined(dc->shm) && !rawBypass && !sc.comp->ProxyActive() &&
+                           !answerViaFd;
+    bool havePrevious = false;
+    if (sc.pendingReq) {
+        // A request that went out is owed its answer even when nothing will use it, or the next
+        // answer this process waits for would be the previous one.
+        const bool reuse = pipelined && sc.pendingW == modelW && sc.pendingH == modelH &&
+                           sc.pendingBytes == sc.comp->ModelBytes();
+        const double now = NowMs();
+        havePrevious = ShmCollect(dc->shm, sc.pendingReq, sc.pendingW, sc.pendingH, sc.pendingBytes,
+                                  reuse ? sc.comp->ModelPixels() : nullptr, false, now, now) &&
+                       reuse;
+        sc.pendingReq = 0;
+    }
+
+    if (pipelined) {
+        if (!NoteVk(dc, dc->vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return false;
+        const bool resolved = havePrevious && sc.comp->RecordResolve(cb, swapchainImage, fs);
+        if (!sc.comp->RecordCapture(cb, swapchainImage, fs) ||
+            (resolved && !sc.comp->RecordComposedCopy(cb, swapchainImage))) {
+            dc->vkEndCommandBuffer(cb);
+            return false;
+        }
+        // The proxy this frame hands over is written by these commands, so the request waits for
+        // them; the composed copy rides the same submit and the present is ordered behind it.
+        if (!endAndSubmit(sc.fenceLeg1)) return false;
+        if (!waitAndReset(sc.fenceLeg1)) return false;
+        dropWaits();
+        sc.comp->ConsumeMeter();
+        if (resolved) sc.comp->MarkModelFrame();
+
+        uint32_t req = 0;
+        double tCopy = 0.0;
+        if (ShmSend(dc->shm, modelW, modelH, sc.comp->ModelBytes(), sc.comp->ProxyPixels(),
+                    sc.comp->ProxyActive(), sc.comp->HdrProxyActive(), &req, &tCopy)) {
+            sc.pendingReq = req;
+            sc.pendingW = modelW;
+            sc.pendingH = modelH;
+            sc.pendingBytes = sc.comp->ModelBytes();
+        }
+        if (resolved) PublishFrameStats(dc, sc, time ? NowMs() - t0 : 0.0);
+        if (time) {
+            static int frameNo = 0;
+            if (++frameNo % TimeInterval() == 0)
+                Log("[time] pipelined total=%.2f ms (model %ux%u)", NowMs() - t0, modelW, modelH);
+        }
+        return resolved;
+    }
+
     // ---- leg 1: the frame the model is shown ----
     if (!NoteVk(dc, dc->vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return false;
     if (!sc.comp->RecordCapture(cb, swapchainImage, fs)) {
@@ -1637,17 +1751,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     sc.leg2Pending = true;
     const double tReturn = time ? NowMs() : 0.0;
 
-    if (dc->shm.hdr) {
-        ShmStore64(dc->shm.hdr->layerFramesLo, dc->shm.hdr->layerFramesHi, ++dc->framesComposed);
-        dc->shm.hdr->layerWidth.store(sc.width);
-        dc->shm.hdr->layerHeight.store(sc.height);
-        dc->shm.hdr->layerFormat.store(uint32_t(sc.format));
-        dc->shm.hdr->layerCompositionUp.store(1);
-        dc->shm.hdr->layerPid.store(uint32_t(getpid()));
-        dc->shm.hdr->layerMsBits.store(FloatToBits(float(tReturn - t0)));
-        dc->shm.hdr->layerMeasuredWhiteBits.store(FloatToBits(sc.comp->MeasuredWhitePoint()));
-        dc->shm.hdr->layerHeartbeat.fetch_add(1);
-    }
+    PublishFrameStats(dc, sc, tReturn - t0);
 
     if (time) {
         static int frameNo = 0;
