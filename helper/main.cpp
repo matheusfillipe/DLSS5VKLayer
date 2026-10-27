@@ -1125,6 +1125,26 @@ static bool UploadMappedPixels(VkCtx& c, GpuImage& img, size_t bytes,
     return SubmitAndWait(c, c.cmdScratch);
 }
 
+// Fills the model's depth input from the staging buffer and leaves it ready for the model to read.
+static bool UploadDepthPixels(VkCtx& c, GpuImage& depth, const void* pixels, size_t bytes) {
+    if (bytes > c.stagingSize && !CreateStaging(c, bytes)) return false;
+    if (!c.uploadMap) return false;
+    std::memcpy(c.uploadMap, pixels, bytes);
+    if (!BeginCmd(c.cmdScratch)) return false;
+    TransitionImage(c, c.cmdScratch, depth, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferImageCopy region{};
+    region.imageSubresource = { depth.aspect(), 0, 0, 1 };
+    region.imageExtent = { depth.width, depth.height, 1 };
+    vkCmdCopyBufferToImage(c.cmdScratch, c.uploadStaging, depth.image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    TransitionImage(c, c.cmdScratch, depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    return SubmitAndWait(c, c.cmdScratch);
+}
+
 static bool ReadbackPixels(VkCtx& c, GpuImage& img, size_t bytes) {
     if (c.transportOut) {
         // The answer lands in the shared-memory region itself; the layer's acquire fence on
@@ -1203,6 +1223,8 @@ struct NeuralState {
     // a pass must read the previous pass's answer while writing its own: with a single surface the
     // model would be reading and writing the same image.
     GpuImage colorIn{}, workA{}, workB{}, mv{}, depth{};
+    // The depth image holds the game's depth rather than flat zeros.
+    bool gameDepth = false;
     // Where the chain lands before it leaves. The passes run at higher precision than the
     // transport, so the last one is brought down to the transport's format here, once.
     GpuImage colorOut{};
@@ -2656,6 +2678,24 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         const int rc = ReactivateMotionVectors(ns, w, h, ns.mvecQuality);
         if (rc < 0) return false;
         if (rc == 0) Log("[helper] estimated motion vectors disabled after a quality change");
+    }
+
+    // The game's depth, when the layer found it, sits right after the proxy. This runs before the
+    // proxy takes the staging buffer, because both pass through it.
+    const size_t depthBytes = size_t(w) * h * sizeof(float);
+    const bool depthSent =
+        reinterpret_cast<const std::atomic<uint32_t>*>(static_cast<uint8_t*>(shm.base) + kDepthPresentOffset)
+            ->load(std::memory_order_acquire) != 0 &&
+        bytes + depthBytes <= kMaxFrame;
+    if (depthSent) {
+        if (!UploadDepthPixels(ns.vk, ns.depth, shm.inPixels + bytes, depthBytes)) return false;
+        if (!ns.gameDepth) Log("[depth] the model now receives the game's depth");
+        ns.gameDepth = true;
+    } else if (ns.gameDepth) {
+        std::vector<uint8_t> zeros(depthBytes, 0);
+        if (!UploadDepthPixels(ns.vk, ns.depth, zeros.data(), depthBytes)) return false;
+        Log("[depth] the model is back on flat depth");
+        ns.gameDepth = false;
     }
 
     // The proxy the layer encoded. It is already in the chain's own format -- 8-bit display-referred,

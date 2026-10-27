@@ -27,6 +27,7 @@
 
 #include "../../common/shm_protocol.h"
 #include "composition.h"
+#include "depth_capture.h"
 #include "hotkey.h"
 #include "vk_table.h"
 
@@ -194,7 +195,10 @@ static void* ShmMapAligned(int fd, off_t offset, size_t want, uintptr_t hint) {
 }
 
 // Maps the two pixel regions at the size this frame needs, remapping when the size changes.
-static bool ShmMapFrames(ShmMap& s, size_t bytes) {
+static bool ShmMapFrames(ShmMap& s, size_t frameBytes) {
+    // The depth rides behind the proxy in the input region. It is at most as large as the proxy, so
+    // we map twice the frame and never remap a region the composition has imported.
+    const size_t bytes = dlssnr::DepthCapture::Enabled() ? frameBytes * 2 : frameBytes;
     if (s.mappedFrameBytes >= bytes && s.inPixels && s.outPixels) return true;
     if (bytes > kMaxFrame) return false;
 
@@ -359,12 +363,23 @@ static bool ShmPipelined(const ShmMap& s) {
     return flag->load(std::memory_order_relaxed) != 0;
 }
 
+// The session host's switch for handing the model the game's depth, beside the pipelined one.
+static constexpr size_t kDepthWantedOffset = kHeaderBytes - 56;
+
+static bool ShmDepthWanted(const ShmMap& s) {
+    if (!s.hdr) return false;
+    const auto* flag = reinterpret_cast<const std::atomic<uint32_t>*>(
+        reinterpret_cast<const uint8_t*>(s.hdr) + kDepthWantedOffset);
+    return flag->load(std::memory_order_relaxed) != 0;
+}
+
 static bool ShmCollect(ShmMap& s, uint32_t req, uint32_t w, uint32_t h, size_t bytes, void* modelOut,
                        bool answerFromFd, double t0, double tCopy);
 
 // Publish the proxy and the request for it. *reqOut is the number to collect the answer by.
 static bool ShmSend(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, const void* proxy,
-                    bool proxyInRegion, bool hdrEncode, uint32_t* reqOut, double* tCopyOut) {
+                    bool proxyInRegion, bool hdrEncode, const float* depth, uint32_t* reqOut,
+                    double* tCopyOut) {
     if (s.dead) return false;
     if (!ShmOpen(s)) { s.dead = true; return false; }
     if (w > kMaxW || h > kMaxH || w < kMinW || h < kMinH) return false;
@@ -383,6 +398,11 @@ static bool ShmSend(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, const void*
     // Say what the bytes ARE before announcing them: the helper sizes its read by this, never by
     // what it hopes the layer has switched to. The release fence below covers it like the pixels.
     s.hdr->hdrEncode.store(hdrEncode ? 1u : 0u);
+    const size_t depthBytes = size_t(w) * h * sizeof(float);
+    const bool sendDepth = depth && s.mappedFrameBytes >= bytes + depthBytes;
+    if (sendDepth) std::memcpy(s.inPixels + bytes, depth, depthBytes);
+    reinterpret_cast<std::atomic<uint32_t>*>(reinterpret_cast<uint8_t*>(s.hdr) + kDepthPresentOffset)
+        ->store(sendDepth ? 1u : 0u, std::memory_order_relaxed);
     uint32_t req = s.hdr->seq_req.load() + 1;
     // The release pairs with the helper's acquire on seq_resp: everything this process wrote --
     // the proxy, whether by the GPU into the imported region or by the memcpy above -- is visible
@@ -396,11 +416,12 @@ static bool ShmSend(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, const void*
 }
 
 static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, const void* proxy,
-                          void* modelOut, bool proxyInRegion, bool answerFromFd, bool hdrEncode) {
+                          void* modelOut, bool proxyInRegion, bool answerFromFd, bool hdrEncode,
+                          const float* depth) {
     const double t0 = NowMs();
     uint32_t req = 0;
     double tCopy = 0.0;
-    if (!ShmSend(s, w, h, bytes, proxy, proxyInRegion, hdrEncode, &req, &tCopy)) return false;
+    if (!ShmSend(s, w, h, bytes, proxy, proxyInRegion, hdrEncode, depth, &req, &tCopy)) return false;
     return ShmCollect(s, req, w, h, bytes, modelOut, answerFromFd, t0, tCopy);
 }
 
@@ -507,7 +528,11 @@ struct InstanceChain {
     X(vkMapMemory) X(vkUnmapMemory) X(vkCreateBuffer) X(vkDestroyBuffer) \
     X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkCmdCopyBufferToImage) \
     X(vkCmdCopyImageToBuffer) X(vkCmdPipelineBarrier) X(vkDeviceWaitIdle) \
-    X(vkAcquireNextImageKHR) X(vkReleaseSwapchainImagesEXT)
+    X(vkAcquireNextImageKHR) X(vkReleaseSwapchainImagesEXT) \
+    X(vkCreateRenderPass) X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) \
+    X(vkDestroyFramebuffer) X(vkCmdBeginRenderPass) X(vkCmdBeginRenderPass2) X(vkCmdEndRenderPass) \
+    X(vkCmdEndRenderPass2) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdDraw) X(vkCmdDrawIndexed) \
+    X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdPipelineBarrier2)
 
 struct SwapchainState {
     std::vector<VkImage> images;
@@ -607,12 +632,22 @@ struct DeviceChain {
     // image behind the descriptor changed and the reference is taken again.
     uint32_t proxySeqSeen = 0;
     uint32_t answerSeqSeen = 0;
+
+    dlssnr::DepthCapture depth;
+    VkBuffer depthBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory depthMemory = VK_NULL_HANDLE;
+    const uint8_t* depthMapped = nullptr;
+    size_t depthBufferBytes = 0;
+    // The last depth sent, at the model's raster, so a repaint hands the model the same shape.
+    std::vector<float> depthModel;
 };
 
 static std::unordered_map<VkInstance, InstanceChain> g_instances;
 static std::unordered_map<VkPhysicalDevice, InstanceChain*> g_phys;
 static std::unordered_map<VkDevice, DeviceChain*> g_devices;
 static std::mutex g_stateMutex;
+// Bumped whenever g_devices changes, so a cached command-buffer lookup knows to look again.
+static std::atomic<uint64_t> g_deviceGeneration{0};
 
 // The one swapchain allowed to drive the neural round trip, chosen as the largest in the process.
 //
@@ -976,6 +1011,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
 #define X(name) dc->name = (PFN_##name)next_dpa(*pDevice, #name);
     DEVICE_FN_LIST(X)
 #undef X
+    // Devices below 1.3 reach these through the extensions that introduced them.
+    if (!dc->vkCreateRenderPass2) dc->vkCreateRenderPass2 = (PFN_vkCreateRenderPass2)next_dpa(*pDevice, "vkCreateRenderPass2KHR");
+    if (!dc->vkCmdBeginRenderPass2) dc->vkCmdBeginRenderPass2 = (PFN_vkCmdBeginRenderPass2)next_dpa(*pDevice, "vkCmdBeginRenderPass2KHR");
+    if (!dc->vkCmdEndRenderPass2) dc->vkCmdEndRenderPass2 = (PFN_vkCmdEndRenderPass2)next_dpa(*pDevice, "vkCmdEndRenderPass2KHR");
+    if (!dc->vkCmdBeginRendering) dc->vkCmdBeginRendering = (PFN_vkCmdBeginRendering)next_dpa(*pDevice, "vkCmdBeginRenderingKHR");
+    if (!dc->vkCmdEndRendering) dc->vkCmdEndRendering = (PFN_vkCmdEndRendering)next_dpa(*pDevice, "vkCmdEndRenderingKHR");
+    if (!dc->vkCmdPipelineBarrier2) dc->vkCmdPipelineBarrier2 = (PFN_vkCmdPipelineBarrier2)next_dpa(*pDevice, "vkCmdPipelineBarrier2KHR");
     dc->table.next_dpa = next_dpa;
     dc->table.Load(*pDevice);
     dc->releaseImages = addedSwapMaint && dc->vkReleaseSwapchainImagesEXT != nullptr;
@@ -998,6 +1040,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
 
     std::lock_guard<std::mutex> lk(g_stateMutex);
     g_devices[*pDevice] = dc;
+    g_deviceGeneration.fetch_add(1);
     Log("[layer] vkCreateDevice -> %p on %s (inert=%d enabled=%d)", (void*)*pDevice, deviceName,
         (int) dc->inert.load(), (int) LayerEnabled());
 
@@ -1204,6 +1247,7 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device,
         std::lock_guard<std::mutex> lk(g_stateMutex);
         auto it = g_devices.find(device);
         if (it != g_devices.end()) { dc = it->second; g_devices.erase(it); }
+        g_deviceGeneration.fetch_add(1);
     }
     if (!dc) return;
     // Before anything it touches is destroyed, and outside the lock it takes.
@@ -1222,6 +1266,8 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device,
         dc->shm.hdr->layerCompositionUp.store(0);
     }
     if (dc->vkDeviceWaitIdle) dc->vkDeviceWaitIdle(device);
+    if (dc->depthBuffer) dc->vkDestroyBuffer(device, dc->depthBuffer, nullptr);
+    if (dc->depthMemory) dc->vkFreeMemory(device, dc->depthMemory, nullptr);
     {
         std::lock_guard<std::mutex> lk(dc->lock);
         for (auto& kv : dc->swapchains) {
@@ -1480,6 +1526,120 @@ static void PublishFrameStats(DeviceChain* dc, SwapchainState& sc, double layerM
     dc->shm.hdr->layerHeartbeat.fetch_add(1);
 }
 
+// A host-visible buffer the depth buffer is copied into at present, grown as the depth grows.
+static bool EnsureDepthBuffer(DeviceChain* dc, size_t bytes) {
+    if (dc->depthBufferBytes >= bytes) return true;
+    VkDevice d = dc->self;
+    if (dc->depthBuffer) dc->vkDestroyBuffer(d, dc->depthBuffer, nullptr);
+    if (dc->depthMemory) dc->vkFreeMemory(d, dc->depthMemory, nullptr);
+    dc->depthBuffer = VK_NULL_HANDLE;
+    dc->depthMemory = VK_NULL_HANDLE;
+    dc->depthMapped = nullptr;
+    dc->depthBufferBytes = 0;
+
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = bytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (dc->vkCreateBuffer(d, &bci, nullptr, &dc->depthBuffer) != VK_SUCCESS) return false;
+    VkMemoryRequirements req{};
+    dc->vkGetBufferMemoryRequirements(d, dc->depthBuffer, &req);
+    VkPhysicalDeviceMemoryProperties mp{};
+    dc->instance->vkGetPhysicalDeviceMemoryProperties(dc->physical, &mp);
+    const VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    int best = -1, bestScore = -1;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+        const VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+        if (!(req.memoryTypeBits & (1u << i)) || (f & required) != required) continue;
+        const int score = (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? 1 : 0;
+        if (score > bestScore) { bestScore = score; best = int(i); }
+    }
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = uint32_t(best);
+    void* mapped = nullptr;
+    if (best < 0 || dc->vkAllocateMemory(d, &mai, nullptr, &dc->depthMemory) != VK_SUCCESS ||
+        dc->vkBindBufferMemory(d, dc->depthBuffer, dc->depthMemory, 0) != VK_SUCCESS ||
+        dc->vkMapMemory(d, dc->depthMemory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+        Log("[depth] could not allocate a %zu-byte readback buffer", bytes);
+        return false;
+    }
+    dc->depthMapped = static_cast<const uint8_t*>(mapped);
+    dc->depthBufferBytes = bytes;
+    return true;
+}
+
+static void RecordDepthCopy(DeviceChain* dc, VkCommandBuffer cb, const dlssnr::DepthCapture::Pick& pick) {
+    VkImageMemoryBarrier b{};
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b.oldLayout = pick.layout;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = pick.image;
+    const bool stencil = pick.format == VK_FORMAT_D16_UNORM_S8_UINT || pick.format == VK_FORMAT_D24_UNORM_S8_UINT ||
+                         pick.format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+    b.subresourceRange = {VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | (stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0)),
+                          0, 1, 0, 1};
+    dc->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                             nullptr, 0, nullptr, 1, &b);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    region.imageExtent = {pick.width, pick.height, 1};
+    dc->vkCmdCopyImageToBuffer(cb, pick.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dc->depthBuffer, 1, &region);
+    std::swap(b.oldLayout, b.newLayout);
+    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dc->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
+                             nullptr, 0, nullptr, 1, &b);
+}
+
+// Resamples the copied depth onto the model's raster as reversed depth, 1 near and 0 far, which is
+// what the helper tells the model to expect. A game with the usual 0-near depth clears to 1, so when
+// more pixels sit at 1 than at 0 we flip it.
+static const float* ResampleDepth(DeviceChain* dc, const dlssnr::DepthCapture::Pick& pick, uint32_t mw, uint32_t mh) {
+    dc->depthModel.resize(size_t(mw) * mh);
+    const bool d16 = pick.format == VK_FORMAT_D16_UNORM || pick.format == VK_FORMAT_D16_UNORM_S8_UINT;
+    const bool d24 = pick.format == VK_FORMAT_X8_D24_UNORM_PACK32 || pick.format == VK_FORMAT_D24_UNORM_S8_UINT;
+    size_t ones = 0, zeros = 0;
+    for (uint32_t y = 0; y < mh; ++y) {
+        const size_t row = size_t(uint64_t(y) * pick.height / mh) * pick.width;
+        for (uint32_t x = 0; x < mw; ++x) {
+            const size_t texel = row + size_t(uint64_t(x) * pick.width / mw);
+            float v;
+            if (d16) {
+                uint16_t u;
+                std::memcpy(&u, dc->depthMapped + texel * 2, 2);
+                v = u / 65535.0f;
+            } else if (d24) {
+                uint32_t u;
+                std::memcpy(&u, dc->depthMapped + texel * 4, 4);
+                v = (u & 0xFFFFFFu) / 16777215.0f;
+            } else {
+                std::memcpy(&v, dc->depthMapped + texel * 4, 4);
+                if (!(v >= 0.0f)) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+            }
+            ones += v >= 0.99999f;
+            zeros += v <= 0.00001f;
+            dc->depthModel[size_t(y) * mw + x] = v;
+        }
+    }
+    const bool flip = ones > zeros;
+    static int lastFlip = -1;
+    if (int(flip) != lastFlip) {
+        lastFlip = int(flip);
+        Log("[depth] %ux%u format %d, %s depth (at 1: %zu, at 0: %zu)", pick.width, pick.height,
+            int(pick.format), flip ? "standard" : "reversed", ones, zeros);
+    }
+    if (flip)
+        for (float& v : dc->depthModel) v = 1.0f - v;
+    return dc->depthModel.data();
+}
+
 static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
                             VkImage swapchainImage, uint32_t waitCount,
                             const VkSemaphore* waitSemaphores, bool repaint,
@@ -1672,6 +1832,17 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     // updates at the model's. After kStaleAnswerMs without an answer we fall back to the blocking
     // collect, which knows how to give up on a helper that died.
     static constexpr double kStaleAnswerMs = 500.0;
+
+    dlssnr::DepthCapture::Pick depthPick{};
+    const bool captureDepth = dlssnr::DepthCapture::Enabled() && !repaint && ShmDepthWanted(dc->shm) &&
+                              dc->depth.PickAndReset(sc.width, sc.height, &depthPick) &&
+                              EnsureDepthBuffer(dc, size_t(depthPick.width) * depthPick.height * 4);
+    const size_t modelPixels = size_t(modelW) * modelH;
+    const auto depthForModel = [&]() -> const float* {
+        if (captureDepth) return ResampleDepth(dc, depthPick, modelW, modelH);
+        if (repaint && ShmDepthWanted(dc->shm) && dc->depthModel.size() == modelPixels) return dc->depthModel.data();
+        return nullptr;
+    };
     if (pipelined && sc.pendingReq && sc.comp->HasModelFrame() && dc->shm.hdr &&
         sc.pendingW == modelW && sc.pendingH == modelH && sc.pendingBytes == sc.comp->ModelBytes() &&
         dc->shm.hdr->seq_resp.load(std::memory_order_acquire) < sc.pendingReq &&
@@ -1709,6 +1880,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
             dc->vkEndCommandBuffer(cb);
             return false;
         }
+        if (captureDepth) RecordDepthCopy(dc, cb, depthPick);
         // The proxy this frame hands over is written by these commands, so the request waits for
         // them; the composed copy rides the same submit and the present is ordered behind it.
         if (!endAndSubmit(sc.fenceLeg1)) return false;
@@ -1720,7 +1892,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         uint32_t req = 0;
         double tCopy = 0.0;
         if (ShmSend(dc->shm, modelW, modelH, sc.comp->ModelBytes(), sc.comp->ProxyPixels(),
-                    sc.comp->ProxyActive(), sc.comp->HdrProxyActive(), &req, &tCopy)) {
+                    sc.comp->ProxyActive(), sc.comp->HdrProxyActive(), depthForModel(), &req, &tCopy)) {
             sc.pendingReq = req;
             sc.pendingW = modelW;
             sc.pendingH = modelH;
@@ -1742,6 +1914,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         dc->vkEndCommandBuffer(cb);
         return false;
     }
+    if (captureDepth) RecordDepthCopy(dc, cb, depthPick);
     // This one fence is real: the proxy the helper is about to read is written by these commands,
     // and the sequence number must not outrun the pixels it announces.
     if (!endAndSubmit(sc.fenceLeg1)) return false;
@@ -1753,7 +1926,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     // ---- the round trip ----
     if (!ShmProcessFrame(dc->shm, sc.comp->ModelWidth(), sc.comp->ModelHeight(), sc.comp->ModelBytes(),
                          sc.comp->ProxyPixels(), sc.comp->ModelPixels(), sc.comp->ProxyActive(),
-                         answerViaFd, sc.comp->HdrProxyActive())) {
+                         answerViaFd, sc.comp->HdrProxyActive(), depthForModel())) {
         // Fail-open. Leg 1 already put the image back in PRESENT_SRC_KHR, so the original frame is
         // what gets presented and nothing else is owed.
         return false;
@@ -1935,6 +2108,246 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_AcquireNextImageKHR(VkDevice device, 
 }
 
 // ---------------------------------------------------------------------------
+// Depth capture: what the game renders, watched as it records. See depth_capture.h.
+// ---------------------------------------------------------------------------
+// Every dispatchable handle of a device starts with that device's dispatch table pointer.
+static DeviceChain* DeviceForHandle(const void* handle) {
+    thread_local const void* cachedKey = nullptr;
+    thread_local DeviceChain* cachedDevice = nullptr;
+    thread_local uint64_t cachedGeneration = ~uint64_t(0);
+    const void* key = *static_cast<void* const*>(handle);
+    const uint64_t generation = g_deviceGeneration.load(std::memory_order_acquire);
+    if (key == cachedKey && generation == cachedGeneration) return cachedDevice;
+    std::lock_guard<std::mutex> lk(g_stateMutex);
+    cachedKey = key;
+    cachedGeneration = generation;
+    cachedDevice = nullptr;
+    for (auto& kv : g_devices)
+        if (*reinterpret_cast<void* const*>(kv.first) == key) cachedDevice = kv.second;
+    return cachedDevice;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateImage(VkDevice device, const VkImageCreateInfo* pInfo,
+                                                       const VkAllocationCallbacks* pAllocator, VkImage* pImage) {
+    DeviceChain* dc = FindDevice(device);
+    VkImageCreateInfo info = *pInfo;
+    // We copy the depth out at present, which the image has to allow from its creation.
+    const bool depth = dlssnr::DepthCapture::IsDepthFormat(info.format) &&
+                       (info.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) &&
+                       info.samples == VK_SAMPLE_COUNT_1_BIT && info.imageType == VK_IMAGE_TYPE_2D;
+    if (depth) info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    const VkResult r = dc->vkCreateImage(device, &info, pAllocator, pImage);
+    if (r == VK_SUCCESS && depth) dc->depth.OnImageCreated(*pImage, info);
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL Hook_DestroyImage(VkDevice device, VkImage image,
+                                                    const VkAllocationCallbacks* pAllocator) {
+    DeviceChain* dc = FindDevice(device);
+    if (image) dc->depth.OnImageDestroyed(image);
+    dc->vkDestroyImage(device, image, pAllocator);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateImageView(VkDevice device, const VkImageViewCreateInfo* pInfo,
+                                                           const VkAllocationCallbacks* pAllocator, VkImageView* pView) {
+    DeviceChain* dc = FindDevice(device);
+    const VkResult r = dc->vkCreateImageView(device, pInfo, pAllocator, pView);
+    if (r == VK_SUCCESS) dc->depth.OnViewCreated(*pView, pInfo->image);
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL Hook_DestroyImageView(VkDevice device, VkImageView view,
+                                                        const VkAllocationCallbacks* pAllocator) {
+    DeviceChain* dc = FindDevice(device);
+    if (view) dc->depth.OnViewDestroyed(view);
+    dc->vkDestroyImageView(device, view, pAllocator);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateFramebuffer(VkDevice device, const VkFramebufferCreateInfo* pInfo,
+                                                             const VkAllocationCallbacks* pAllocator,
+                                                             VkFramebuffer* pFramebuffer) {
+    DeviceChain* dc = FindDevice(device);
+    const VkResult r = dc->vkCreateFramebuffer(device, pInfo, pAllocator, pFramebuffer);
+    if (r == VK_SUCCESS) dc->depth.OnFramebufferCreated(*pFramebuffer, *pInfo);
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL Hook_DestroyFramebuffer(VkDevice device, VkFramebuffer framebuffer,
+                                                          const VkAllocationCallbacks* pAllocator) {
+    DeviceChain* dc = FindDevice(device);
+    if (framebuffer) dc->depth.OnFramebufferDestroyed(framebuffer);
+    dc->vkDestroyFramebuffer(device, framebuffer, pAllocator);
+}
+
+// The first subpass that tests depth names the pass's depth attachment.
+template <typename SubpassT, typename AttachmentT>
+static void NoteRenderPass(DeviceChain* dc, VkRenderPass renderPass, uint32_t subpassCount, const SubpassT* subpasses,
+                           const AttachmentT* attachments) {
+    for (uint32_t i = 0; i < subpassCount; ++i) {
+        const auto* ds = subpasses[i].pDepthStencilAttachment;
+        if (!ds || ds->attachment == VK_ATTACHMENT_UNUSED) continue;
+        dc->depth.OnRenderPassCreated(renderPass, int(ds->attachment), attachments[ds->attachment].finalLayout);
+        return;
+    }
+    dc->depth.OnRenderPassCreated(renderPass, -1, VK_IMAGE_LAYOUT_UNDEFINED);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateRenderPass(VkDevice device, const VkRenderPassCreateInfo* pInfo,
+                                                            const VkAllocationCallbacks* pAllocator,
+                                                            VkRenderPass* pRenderPass) {
+    DeviceChain* dc = FindDevice(device);
+    const VkResult r = dc->vkCreateRenderPass(device, pInfo, pAllocator, pRenderPass);
+    if (r == VK_SUCCESS) NoteRenderPass(dc, *pRenderPass, pInfo->subpassCount, pInfo->pSubpasses, pInfo->pAttachments);
+    return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateRenderPass2(VkDevice device, const VkRenderPassCreateInfo2* pInfo,
+                                                             const VkAllocationCallbacks* pAllocator,
+                                                             VkRenderPass* pRenderPass) {
+    DeviceChain* dc = FindDevice(device);
+    const VkResult r = dc->vkCreateRenderPass2(device, pInfo, pAllocator, pRenderPass);
+    if (r == VK_SUCCESS) NoteRenderPass(dc, *pRenderPass, pInfo->subpassCount, pInfo->pSubpasses, pInfo->pAttachments);
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL Hook_DestroyRenderPass(VkDevice device, VkRenderPass renderPass,
+                                                         const VkAllocationCallbacks* pAllocator) {
+    DeviceChain* dc = FindDevice(device);
+    if (renderPass) dc->depth.OnRenderPassDestroyed(renderPass);
+    dc->vkDestroyRenderPass(device, renderPass, pAllocator);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Hook_CmdBeginRenderPass(VkCommandBuffer cb, const VkRenderPassBeginInfo* pInfo,
+                                                          VkSubpassContents contents) {
+    DeviceChain* dc = DeviceForHandle(cb);
+    dc->depth.BeginRenderPass(cb, *pInfo);
+    dc->vkCmdBeginRenderPass(cb, pInfo, contents);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Hook_CmdBeginRenderPass2(VkCommandBuffer cb, const VkRenderPassBeginInfo* pInfo,
+                                                           const VkSubpassBeginInfo* pSubpass) {
+    DeviceChain* dc = DeviceForHandle(cb);
+    dc->depth.BeginRenderPass(cb, *pInfo);
+    dc->vkCmdBeginRenderPass2(cb, pInfo, pSubpass);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Hook_CmdEndRenderPass(VkCommandBuffer cb) {
+    DeviceChain* dc = DeviceForHandle(cb);
+    dc->depth.EndPass(cb);
+    dc->vkCmdEndRenderPass(cb);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Hook_CmdEndRenderPass2(VkCommandBuffer cb, const VkSubpassEndInfo* pEnd) {
+    DeviceChain* dc = DeviceForHandle(cb);
+    dc->depth.EndPass(cb);
+    dc->vkCmdEndRenderPass2(cb, pEnd);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Hook_CmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo* pInfo) {
+    DeviceChain* dc = DeviceForHandle(cb);
+    const VkRenderingAttachmentInfo* depth = pInfo->pDepthAttachment;
+    dc->depth.BeginRendering(cb, depth ? depth->imageView : VK_NULL_HANDLE,
+                             depth ? depth->imageLayout : VK_IMAGE_LAYOUT_UNDEFINED);
+    dc->vkCmdBeginRendering(cb, pInfo);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Hook_CmdEndRendering(VkCommandBuffer cb) {
+    DeviceChain* dc = DeviceForHandle(cb);
+    dc->depth.EndPass(cb);
+    dc->vkCmdEndRendering(cb);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Hook_CmdDraw(VkCommandBuffer cb, uint32_t vertexCount, uint32_t instanceCount,
+                                               uint32_t firstVertex, uint32_t firstInstance) {
+    DeviceChain* dc = DeviceForHandle(cb);
+    dc->depth.Draw(cb, uint64_t(vertexCount) * instanceCount);
+    dc->vkCmdDraw(cb, vertexCount, instanceCount, firstVertex, firstInstance);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Hook_CmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uint32_t instanceCount,
+                                                      uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) {
+    DeviceChain* dc = DeviceForHandle(cb);
+    dc->depth.Draw(cb, uint64_t(indexCount) * instanceCount);
+    dc->vkCmdDrawIndexed(cb, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+}
+
+// An indirect draw's vertex count lives in GPU memory, so we weigh each one as a mid-sized mesh.
+static constexpr uint64_t kIndirectDrawWeight = 1000;
+
+static VKAPI_ATTR void VKAPI_CALL Hook_CmdDrawIndirect(VkCommandBuffer cb, VkBuffer buffer, VkDeviceSize offset,
+                                                       uint32_t drawCount, uint32_t stride) {
+    DeviceChain* dc = DeviceForHandle(cb);
+    dc->depth.Draw(cb, drawCount * kIndirectDrawWeight);
+    dc->vkCmdDrawIndirect(cb, buffer, offset, drawCount, stride);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Hook_CmdDrawIndexedIndirect(VkCommandBuffer cb, VkBuffer buffer, VkDeviceSize offset,
+                                                              uint32_t drawCount, uint32_t stride) {
+    DeviceChain* dc = DeviceForHandle(cb);
+    dc->depth.Draw(cb, drawCount * kIndirectDrawWeight);
+    dc->vkCmdDrawIndexedIndirect(cb, buffer, offset, drawCount, stride);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Hook_CmdPipelineBarrier(
+    VkCommandBuffer cb, VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage, VkDependencyFlags flags,
+    uint32_t memoryCount, const VkMemoryBarrier* pMemory, uint32_t bufferCount, const VkBufferMemoryBarrier* pBuffer,
+    uint32_t imageCount, const VkImageMemoryBarrier* pImage) {
+    DeviceChain* dc = DeviceForHandle(cb);
+    for (uint32_t i = 0; i < imageCount; ++i) dc->depth.Barrier(pImage[i].image, pImage[i].newLayout);
+    dc->vkCmdPipelineBarrier(cb, srcStage, dstStage, flags, memoryCount, pMemory, bufferCount, pBuffer, imageCount,
+                             pImage);
+}
+
+static VKAPI_ATTR void VKAPI_CALL Hook_CmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo* pInfo) {
+    DeviceChain* dc = DeviceForHandle(cb);
+    for (uint32_t i = 0; i < pInfo->imageMemoryBarrierCount; ++i)
+        dc->depth.Barrier(pInfo->pImageMemoryBarriers[i].image, pInfo->pImageMemoryBarriers[i].newLayout);
+    dc->vkCmdPipelineBarrier2(cb, pInfo);
+}
+
+static PFN_vkVoidFunction LookupDepthHook(const char* n) {
+    static const struct { const char* name; PFN_vkVoidFunction fn; } hooks[] = {
+        {"vkCreateImage", (PFN_vkVoidFunction)Hook_CreateImage},
+        {"vkDestroyImage", (PFN_vkVoidFunction)Hook_DestroyImage},
+        {"vkCreateImageView", (PFN_vkVoidFunction)Hook_CreateImageView},
+        {"vkDestroyImageView", (PFN_vkVoidFunction)Hook_DestroyImageView},
+        {"vkCreateFramebuffer", (PFN_vkVoidFunction)Hook_CreateFramebuffer},
+        {"vkDestroyFramebuffer", (PFN_vkVoidFunction)Hook_DestroyFramebuffer},
+        {"vkCreateRenderPass", (PFN_vkVoidFunction)Hook_CreateRenderPass},
+        {"vkCreateRenderPass2", (PFN_vkVoidFunction)Hook_CreateRenderPass2},
+        {"vkCreateRenderPass2KHR", (PFN_vkVoidFunction)Hook_CreateRenderPass2},
+        {"vkDestroyRenderPass", (PFN_vkVoidFunction)Hook_DestroyRenderPass},
+        {"vkCmdBeginRenderPass", (PFN_vkVoidFunction)Hook_CmdBeginRenderPass},
+        {"vkCmdBeginRenderPass2", (PFN_vkVoidFunction)Hook_CmdBeginRenderPass2},
+        {"vkCmdBeginRenderPass2KHR", (PFN_vkVoidFunction)Hook_CmdBeginRenderPass2},
+        {"vkCmdEndRenderPass", (PFN_vkVoidFunction)Hook_CmdEndRenderPass},
+        {"vkCmdEndRenderPass2", (PFN_vkVoidFunction)Hook_CmdEndRenderPass2},
+        {"vkCmdEndRenderPass2KHR", (PFN_vkVoidFunction)Hook_CmdEndRenderPass2},
+        {"vkCmdBeginRendering", (PFN_vkVoidFunction)Hook_CmdBeginRendering},
+        {"vkCmdBeginRenderingKHR", (PFN_vkVoidFunction)Hook_CmdBeginRendering},
+        {"vkCmdEndRendering", (PFN_vkVoidFunction)Hook_CmdEndRendering},
+        {"vkCmdEndRenderingKHR", (PFN_vkVoidFunction)Hook_CmdEndRendering},
+        {"vkCmdDraw", (PFN_vkVoidFunction)Hook_CmdDraw},
+        {"vkCmdDrawIndexed", (PFN_vkVoidFunction)Hook_CmdDrawIndexed},
+        {"vkCmdDrawIndirect", (PFN_vkVoidFunction)Hook_CmdDrawIndirect},
+        {"vkCmdDrawIndexedIndirect", (PFN_vkVoidFunction)Hook_CmdDrawIndexedIndirect},
+        {"vkCmdPipelineBarrier", (PFN_vkVoidFunction)Hook_CmdPipelineBarrier},
+        {"vkCmdPipelineBarrier2", (PFN_vkVoidFunction)Hook_CmdPipelineBarrier2},
+        {"vkCmdPipelineBarrier2KHR", (PFN_vkVoidFunction)Hook_CmdPipelineBarrier2},
+    };
+    for (const auto& h : hooks)
+        if (!std::strcmp(n, h.name)) return h.fn;
+    return nullptr;
+}
+
+// We hook a device only when its own chain has the call, and never one the layer stays out of.
+static bool DepthHookWanted(VkDevice device, const char* name) {
+    if (!dlssnr::DepthCapture::Enabled() || !device || !LookupDepthHook(name)) return false;
+    DeviceChain* dc = FindDevice(device);
+    return dc && !dc->inert && dc->next_dpa(device, name);
+}
+
+// ---------------------------------------------------------------------------
 // Loader entry points
 // ---------------------------------------------------------------------------
 static PFN_vkVoidFunction LookupHook(const char* n) {
@@ -2044,6 +2457,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice device, co
     if (!pName) return nullptr;
     if (!std::strcmp(pName, "vkGetDeviceProcAddr")) return (PFN_vkVoidFunction)vkGetDeviceProcAddr;
     if (auto fn = LookupDeviceHook(pName)) return fn;
+    if (DepthHookWanted(device, pName)) return LookupDepthHook(pName);
     if (device) {
         std::lock_guard<std::mutex> lk(g_stateMutex);
         auto it = g_devices.find(device);

@@ -51,6 +51,14 @@ static constexpr uint32_t kMinW = 64, kMinH = 64;
 static constexpr size_t kMaxFrame = size_t(kMaxW) * kMaxH * 8;
 static constexpr size_t kHeaderBytes = 65536;
 
+// Control words in the header region past ShmHeader, which tools built from older sources never read,
+// so they need no protocol version of their own.
+//
+// The layer raises kDepthPresentOffset for each request that carries the game's depth: one float per
+// model pixel, reversed (1 near, 0 far), right after the proxy in the input region. 0 hands the model
+// flat depth, as for any frame whose depth the layer could not find.
+static constexpr size_t kDepthPresentOffset = kHeaderBytes - 60;
+
 // The ceiling on how many times the model runs over one frame. It is OptiScaler's
 // DlssNr::kMaxPasses and sizes the per-pass arrays below.
 static constexpr uint32_t kMaxPasses = 30;

@@ -6,6 +6,7 @@ layer_sources = files(
   'src/capture.cpp',
   'src/scaler_vk.cpp',
   'src/hotkey.cpp',
+  'src/depth_capture.cpp',
 )
 
 layer_inc = include_directories('src', '../standalone_runner/third_party')
